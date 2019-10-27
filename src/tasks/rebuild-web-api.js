@@ -10,20 +10,19 @@ const aws = require('aws-sdk'),
 	safeHash = require('../util/safe-hash'),
 	flattenRequestParameters = require('./flatten-request-parameters'),
 	patchBinaryTypes = require('./patch-binary-types'),
-	getOwnerId = require('./get-owner-account-id'),
 	clearApi = require('./clear-api'),
 	registerAuthorizers = require('./register-authorizers');
-module.exports = function rebuildWebApi(functionName, functionVersion, restApiId, apiConfig, awsRegion, optionalLogger, configCacheStageVar) {
+module.exports = function rebuildWebApi(functionName, functionVersion, restApiId, apiConfig, ownerAccount, awsPartition, awsRegion, optionalLogger, configCacheStageVar) {
 	'use strict';
-	let ownerId,
-		authorizerIds;
+	let authorizerIds;
 	const logger = optionalLogger || new NullLogger(),
 		apiGateway = retriableWrap(
-						loggingWrap(
-							new aws.APIGateway({region: awsRegion}),
-							{log: logger.logApiCall, logName: 'apigateway'}
-						),
-						() => logger.logApiCall('rate-limited by AWS, waiting before retry')),
+			loggingWrap(
+				new aws.APIGateway({region: awsRegion}),
+				{log: logger.logApiCall, logName: 'apigateway'}
+			),
+			() => logger.logApiCall('rate-limited by AWS, waiting before retry')
+		),
 		configHash = safeHash(apiConfig),
 		knownIds = {},
 		supportsCors = function () {
@@ -54,7 +53,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				integrationHttpMethod: 'POST',
 				passthroughBehavior: 'WHEN_NO_MATCH',
 				contentHandling: integrationContentHandling,
-				uri: 'arn:aws:apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/arn:aws:lambda:' + awsRegion + ':' + ownerId + ':function:' + functionName + ':${stageVariables.lambdaVersion}/invocations'
+				uri: 'arn:' + awsPartition + ':apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/arn:' + awsPartition + ':lambda:' + awsRegion + ':' + ownerAccount + ':function:' + functionName + ':${stageVariables.lambdaVersion}/invocations'
 			});
 		},
 		corsHeaderValue = function () {
@@ -72,6 +71,9 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				apiKeyRequired = function () {
 					return methodOptions && methodOptions.apiKeyRequired;
 				},
+				authorizationScopes = function () {
+					return methodOptions && methodOptions.authorizationScopes;
+				},
 				authorizationType = function () {
 					if (methodOptions && methodOptions.authorizationType && validAuthType(methodOptions.authorizationType.toUpperCase())) {
 						return methodOptions.authorizationType.toUpperCase();
@@ -88,7 +90,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				credentials = function () {
 					if (methodOptions && methodOptions.invokeWithCredentials) {
 						if (methodOptions.invokeWithCredentials === true) {
-							return 'arn:aws:iam::*:user/*';
+							return 'arn:' + awsPartition + ':iam::*:user/*';
 						} else if (validCredentials(methodOptions.invokeWithCredentials)) {
 							return methodOptions.invokeWithCredentials;
 						}
@@ -122,7 +124,8 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				resourceId: resourceId,
 				restApiId: restApiId,
 				requestParameters: parameters,
-				apiKeyRequired: apiKeyRequired()
+				apiKeyRequired: apiKeyRequired(),
+				authorizationScopes: authorizationScopes()
 			})
 			.then(() => putLambdaIntegration(resourceId, methodName, credentials(), parameters && Object.keys(parameters), methodOptions.requestContentHandling))
 			.then(addMethodResponse);
@@ -259,7 +262,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			});
 		},
 		rebuildApi = function () {
-			return allowApiInvocation(functionName, functionVersion, restApiId, ownerId, awsRegion)
+			return allowApiInvocation(functionName, functionVersion, restApiId, ownerAccount, awsPartition, awsRegion)
 			.then(() => cacheRootId())
 			.then(() => sequentialPromiseMap(Object.keys(apiConfig.routes), configurePath))
 			.then(() => {
@@ -289,7 +292,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 		},
 		configureAuthorizers = function () {
 			if (apiConfig.authorizers && apiConfig.authorizers !== {}) {
-				return registerAuthorizers(apiConfig.authorizers, restApiId, awsRegion, functionVersion, logger)
+				return registerAuthorizers(apiConfig.authorizers, restApiId, ownerAccount, awsPartition, awsRegion, functionVersion, logger)
 				.then(result => {
 					authorizerIds = result;
 				});
@@ -306,17 +309,13 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 		},
 		getExistingConfigHash = function () {
 			if (!configCacheStageVar) {
-				return false;
+				return Promise.resolve(false);
 			}
 			return apiGateway.getStagePromise({ restApiId: restApiId, stageName: functionVersion })
 				.then(stage => stage.variables && stage.variables[configCacheStageVar])
 				.catch(() => false);
 		};
-	return getOwnerId(logger)
-		.then(accountOwnerId => {
-			ownerId = accountOwnerId;
-		})
-		.then(getExistingConfigHash)
+	return getExistingConfigHash()
 		.then(existingHash => {
 			if (existingHash && existingHash === configHash) {
 				logger.logStage('Reusing cached API configuration');

@@ -4,21 +4,25 @@ const underTest = require('../src/commands/create'),
 	tmppath = require('../src/util/tmppath'),
 	destroyObjects = require('./util/destroy-objects'),
 	callApi = require('../src/util/call-api'),
-	templateFile = require('../src/util/template-file'),
 	ArrayLogger = require('../src/util/array-logger'),
 	fs = require('fs'),
 	fsUtil = require('../src/util/fs-util'),
-	fsPromise = require('../src/util/fs-promise'),
 	retriableWrap = require('../src/util/retriable-wrap'),
 	path = require('path'),
 	os = require('os'),
 	aws = require('aws-sdk'),
 	pollForLogEvents = require('./util/poll-for-log-events'),
-	awsRegion = require('./util/test-aws-region');
+	awsRegion = require('./util/test-aws-region'),
+	executorPolicy = require('../src/policies/lambda-executor-policy'),
+	snsPublishPolicy = require('../src/policies/sns-publish-policy'),
+	lambdaCode = require('../src/tasks/lambda-code');
 describe('create', () => {
 	'use strict';
-	let workingdir, testRunName, iam, lambda, newObjects, config, logs, apiGatewayPromise;
-	const createFromDir = function (dir, logger) {
+
+
+	let workingdir, testRunName, iam, lambda, s3, newObjects, config, logs, apiGatewayPromise, sns;
+	const defaultRuntime = 'nodejs10.x',
+		createFromDir = function (dir, logger) {
 			if (!fs.existsSync(workingdir)) {
 				fs.mkdirSync(workingdir);
 			}
@@ -44,13 +48,17 @@ describe('create', () => {
 		getLambdaConfiguration = function () {
 			return lambda.getFunctionConfiguration({ FunctionName: testRunName }).promise();
 		};
+	beforeAll(() => {
+		iam = new aws.IAM({ region: awsRegion });
+		lambda = new aws.Lambda({ region: awsRegion });
+		s3 = new aws.S3({region: awsRegion, signatureVersion: 'v4'});
+		apiGatewayPromise = retriableWrap(new aws.APIGateway({ region: awsRegion }));
+		logs = new aws.CloudWatchLogs({ region: awsRegion });
+		sns = new aws.SNS({region: awsRegion});
+	});
 	beforeEach(() => {
 		workingdir = tmppath();
 		testRunName = 'test' + Date.now();
-		iam = new aws.IAM();
-		lambda = new aws.Lambda({ region: awsRegion });
-		apiGatewayPromise = retriableWrap(new aws.APIGateway({ region: awsRegion }));
-		logs = new aws.CloudWatchLogs({ region: awsRegion });
 		newObjects = { workingdir: workingdir };
 		config = { name: testRunName, region: awsRegion, source: workingdir, handler: 'main.handler' };
 	});
@@ -104,6 +112,14 @@ describe('create', () => {
 			config['api-module'] = 'abc';
 			createFromDir('hello-world')
 			.then(done.fail, message => expect(message).toEqual('deploy-proxy-api requires a handler. please specify with --handler'))
+			.then(done);
+		});
+		it('fails if binary-media-types is specified but deploy-proxy-api is not', done => {
+			config['binary-media-types'] = 'image/jpeg';
+			config.handler = 'main.handler';
+			config['deploy-proxy-api'] = undefined;
+			createFromDir('hello-world')
+			.then(done.fail, message => expect(message).toEqual('binary-media-types only works with --deploy-proxy-api'))
 			.then(done);
 		});
 		it('fails if subnetIds is specified without securityGroupIds', done => {
@@ -224,13 +240,10 @@ describe('create', () => {
 			beforeEach(done => {
 				roleName = `${testRunName}-manual`;
 				logger = new ArrayLogger();
-				fsPromise.readFileAsync(templateFile('lambda-exector-policy.json'), 'utf8')
-				.then(lambdaRolePolicy => {
-					return iam.createRole({
-						RoleName: roleName,
-						AssumeRolePolicyDocument: lambdaRolePolicy
-					}).promise();
-				})
+				return iam.createRole({
+					RoleName: roleName,
+					AssumeRolePolicyDocument: executorPolicy()
+				}).promise()
 				.then(result => {
 					createdRole = result.Role;
 				})
@@ -332,7 +345,23 @@ describe('create', () => {
 			let vpc, subnet, securityGroup;
 			const securityGroupName = `${testRunName}SecurityGroup`,
 				CidrBlock = '10.0.0.0/16',
-				ec2 = new aws.EC2({ region: awsRegion });
+				ec2 = new aws.EC2({ region: awsRegion }),
+				vpcPolicy = {
+					'Version': '2012-10-17',
+					'Statement': [{
+						'Sid': 'VPCAccessExecutionPermission',
+						'Effect': 'Allow',
+						'Action': [
+							'logs:CreateLogGroup',
+							'logs:CreateLogStream',
+							'logs:PutLogEvents',
+							'ec2:CreateNetworkInterface',
+							'ec2:DeleteNetworkInterface',
+							'ec2:DescribeNetworkInterfaces'
+						],
+						'Resource': '*'
+					}]
+				};
 			beforeAll(done => {
 				ec2.createVpc({ CidrBlock: CidrBlock }).promise()
 				.then(vpcData => {
@@ -377,23 +406,7 @@ describe('create', () => {
 				.then(result => expect(result.PolicyNames).toEqual(['log-writer', 'vpc-access-execution']))
 				.then(() => iam.getRolePolicy({ PolicyName: 'vpc-access-execution', RoleName: `${testRunName}-executor` }).promise())
 				.then(policy => {
-					expect(JSON.parse(decodeURIComponent(policy.PolicyDocument))).toEqual(
-						{
-							'Version': '2012-10-17',
-							'Statement': [{
-								'Sid': 'VPCAccessExecutionPermission',
-								'Effect': 'Allow',
-								'Action': [
-									'logs:CreateLogGroup',
-									'logs:CreateLogStream',
-									'logs:PutLogEvents',
-									'ec2:CreateNetworkInterface',
-									'ec2:DeleteNetworkInterface',
-									'ec2:DescribeNetworkInterfaces'
-								],
-								'Resource': '*'
-							}]
-						});
+					expect(JSON.parse(decodeURIComponent(policy.PolicyDocument))).toEqual(vpcPolicy);
 				})
 				.then(done, done.fail);
 			});
@@ -401,13 +414,10 @@ describe('create', () => {
 				let createdRoleArn, roleName;
 				beforeEach(done => {
 					roleName = `${testRunName}-manual`;
-					fsPromise.readFileAsync(templateFile('lambda-exector-policy.json'), 'utf8')
-					.then(lambdaRolePolicy => {
-						return iam.createRole({
-							RoleName: roleName,
-							AssumeRolePolicyDocument: lambdaRolePolicy
-						}).promise();
-					})
+					return iam.createRole({
+						RoleName: roleName,
+						AssumeRolePolicyDocument: executorPolicy()
+					}).promise()
 					.then(result => {
 						createdRoleArn = result.Role.Arn;
 					})
@@ -423,34 +433,17 @@ describe('create', () => {
 					.then(result => expect(result.PolicyNames).toEqual(['vpc-access-execution']))
 					.then(() => iam.getRolePolicy({ PolicyName: 'vpc-access-execution', RoleName: roleName }).promise())
 					.then(policy => {
-						expect(JSON.parse(decodeURIComponent(policy.PolicyDocument))).toEqual(
-							{
-								'Version': '2012-10-17',
-								'Statement': [{
-									'Sid': 'VPCAccessExecutionPermission',
-									'Effect': 'Allow',
-									'Action': [
-										'logs:CreateLogGroup',
-										'logs:CreateLogStream',
-										'logs:PutLogEvents',
-										'ec2:CreateNetworkInterface',
-										'ec2:DeleteNetworkInterface',
-										'ec2:DescribeNetworkInterfaces'
-									],
-									'Resource': '*'
-								}]
-							});
+						expect(JSON.parse(decodeURIComponent(policy.PolicyDocument))).toEqual(vpcPolicy);
 					})
 					.then(done, done.fail);
 				});
 				it('does not try to patch IAM policies if the role is specified with an ARN', done => {
 					config.role = createdRoleArn;
-					fsPromise.readFileAsync(templateFile('vpc-policy.json'), 'utf8')
-					.then(vpcPolicy => iam.putRolePolicy({
+					return iam.putRolePolicy({
 						RoleName: roleName,
 						PolicyName: 'test-vpc-access',
-						PolicyDocument: vpcPolicy
-					}).promise())
+						PolicyDocument: JSON.stringify(vpcPolicy)
+					}).promise()
 					.then(() => createFromDir('hello-world'))
 					.then(() => iam.listRolePolicies({ RoleName: roleName }).promise())
 					.then(result => expect(result.PolicyNames).toEqual(['test-vpc-access']))
@@ -518,17 +511,17 @@ describe('create', () => {
 		});
 	});
 	describe('runtime support', () => {
-		it('creates node 8.10 deployments by default', done => {
+		it('creates node 10 deployments by default', done => {
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual(defaultRuntime))
+			.then(done, done.fail);
+		});
+		it('can create nodejs8.10 when requested', done => {
+			config.runtime = 'nodejs8.10';
 			createFromDir('hello-world')
 			.then(getLambdaConfiguration)
 			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual('nodejs8.10'))
-			.then(done, done.fail);
-		});
-		it('can create nodejs6.10 when requested', done => {
-			config.runtime = 'nodejs6.10';
-			createFromDir('hello-world')
-			.then(getLambdaConfiguration)
-			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual('nodejs6.10'))
 			.then(done, done.fail);
 		});
 	});
@@ -578,10 +571,10 @@ describe('create', () => {
 			.then(done.fail, error => expect(error).toEqual('the timeout value provided must be greater than or equal to 1'))
 			.then(done, done.fail);
 		});
-		it('fails if timeout value is > 300', done => {
-			config.timeout = 301;
+		it('fails if timeout value is > 900', done => {
+			config.timeout = 901;
 			createFromDir('hello-world')
-			.then(done.fail, error => expect(error).toEqual('the timeout value provided must be less than or equal to 300'))
+			.then(done.fail, error => expect(error).toEqual('the timeout value provided must be less than or equal to 900'))
 			.then(done, done.fail);
 		});
 		it('creates timeout of 3 seconds by default', done => {
@@ -591,10 +584,10 @@ describe('create', () => {
 			.then(done, done.fail);
 		});
 		it('can specify timeout using the --timeout argument', done => {
-			config.timeout = 300;
+			config.timeout = 900;
 			createFromDir('hello-world')
 			.then(getLambdaConfiguration)
-			.then(lambdaResult => expect(lambdaResult.Timeout).toEqual(300))
+			.then(lambdaResult => expect(lambdaResult.Timeout).toEqual(900))
 			.then(done, done.fail);
 		});
 	});
@@ -656,7 +649,7 @@ describe('create', () => {
 				});
 			})
 			.then(() => lambda.getFunctionConfiguration({ FunctionName: 'hello-world2' }).promise())
-			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual('nodejs8.10'))
+			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual(defaultRuntime))
 			.then(done, done.fail);
 		});
 		it('renames scoped NPM packages to a sanitized Lambda name', done => {
@@ -670,7 +663,7 @@ describe('create', () => {
 				});
 			})
 			.then(() => lambda.getFunctionConfiguration({ FunctionName: 'test_hello-world' }).promise())
-			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual('nodejs8.10'))
+			.then(lambdaResult => expect(lambdaResult.Runtime).toEqual(defaultRuntime))
 			.then(done, done.fail);
 		});
 		it('uses the package.json description field if --description is not provided', done => {
@@ -794,8 +787,7 @@ describe('create', () => {
 			.then(done, done.fail);
 		});
 		it('uses a s3 bucket if provided', done => {
-			const s3 = new aws.S3(),
-				logger = new ArrayLogger(),
+			const logger = new ArrayLogger(),
 				bucketName = `${testRunName}-bucket`;
 			let archivePath;
 			config.keep = true;
@@ -826,8 +818,7 @@ describe('create', () => {
 			.then(done, done.fail);
 		});
 		it('uses a s3 bucket with server side encryption if provided', done => {
-			const s3 = new aws.S3(),
-				logger = new ArrayLogger(),
+			const logger = new ArrayLogger(),
 				bucketName = `${testRunName}-bucket`,
 				serverSideEncryption = 'AES256';
 			let archivePath;
@@ -978,6 +969,29 @@ describe('create', () => {
 				expect(params.path).toEqual('/hello/there');
 				expect(params.requestContext.stage).toEqual('development');
 			})
+			.then(done, done.fail);
+		});
+		it('sets up binary media types corresponding to the binary-media-types options', done => {
+			config['binary-media-types'] = 'image/png,image/jpeg';
+			createFromDir('apigw-proxy-echo')
+			.then(creationResult => creationResult.api.id)
+			.then(apiId => apiGatewayPromise.getRestApiPromise({ restApiId: apiId }))
+			.then(restApi => expect(restApi.binaryMediaTypes).toEqual(['image/png', 'image/jpeg']))
+			.then(done, done.fail);
+		});
+		it('sets up binary media types to */* if binary-media-types option is not provided', done => {
+			createFromDir('apigw-proxy-echo')
+			.then(creationResult => creationResult.api.id)
+			.then(apiId => apiGatewayPromise.getRestApiPromise({ restApiId: apiId }))
+			.then(restApi => expect(restApi.binaryMediaTypes).toEqual(['*/*']))
+			.then(done, done.fail);
+		});
+		it('sets up binary media types to undefined if binary-media-types option is provided as an empty string', done => {
+			config['binary-media-types'] = '';
+			createFromDir('apigw-proxy-echo')
+			.then(creationResult => creationResult.api.id)
+			.then(apiId => apiGatewayPromise.getRestApiPromise({ restApiId: apiId }))
+			.then(restApi => expect(restApi.binaryMediaTypes).toBeUndefined([]))
 			.then(done, done.fail);
 		});
 	});
@@ -1160,7 +1174,7 @@ describe('create', () => {
 			expect(logger.getApiCallLogForService('lambda', true)).toEqual([
 				'lambda.createFunction',  'lambda.setupRequestListeners', 'lambda.updateAlias', 'lambda.createAlias'
 			]);
-			expect(logger.getApiCallLogForService('iam', true)).toEqual(['iam.createRole']);
+			expect(logger.getApiCallLogForService('iam', true)).toEqual(['iam.createRole', 'iam.putRolePolicy']);
 			expect(logger.getApiCallLogForService('sts', true)).toEqual(['sts.getCallerIdentity']);
 			expect(logger.getApiCallLogForService('apigateway', true)).toEqual([
 				'apigateway.createRestApi',
@@ -1296,6 +1310,165 @@ describe('create', () => {
 			config['api-module'] = 'main';
 			process.env.TEST_VAR = '';
 			createFromDir('throw-if-not-env').then(done, done.fail);
+		});
+	});
+	describe('layer support', () => {
+		let layers;
+		const createLayer = function (layerName, filePath) {
+				return lambdaCode(s3, filePath)
+					.then(contents => lambda.publishLayerVersion({LayerName: layerName, Content: contents}).promise());
+			}, deleteLayer = function (layer) {
+				return lambda.deleteLayerVersion({
+					LayerName: layer.LayerArn,
+					VersionNumber: layer.Version
+				}).promise();
+			};
+		beforeAll((done) => {
+			const prefix = 'test' + Date.now();
+			Promise.all([
+				createLayer(prefix + '-layer-node', path.join(__dirname, 'test-layers', 'nodejs-layer.zip')),
+				createLayer(prefix + '-layer-text', path.join(__dirname, 'test-layers', 'text-layer.zip'))
+			])
+			.then(results => layers = results)
+			.then(done, done.fail);
+		});
+		afterAll((done) => {
+			Promise.all(layers.map(deleteLayer)).then(done, done.fail);
+		});
+		it('attaches no layers by default', (done) => {
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(configuration => {
+				expect(configuration.Layers).toBeFalsy();
+			})
+			.then(done, done.fail);
+		});
+		it('attaches a single layer if requested', (done) => {
+			config.layers = layers[0].LayerVersionArn;
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(configuration => {
+				expect(configuration.Layers.map(l => l.Arn)).toEqual([layers[0].LayerVersionArn]);
+			})
+			.then(done, done.fail);
+		});
+		it('attaches multiple layers if requested', (done) => {
+			config.layers = layers[0].LayerVersionArn + ',' + layers[1].LayerVersionArn;
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(configuration => {
+				expect(configuration.Layers.map(l => l.Arn)).toEqual(layers.map(l => l.LayerVersionArn));
+			})
+			.then(done, done.fail);
+		});
+	});
+	describe('dead letter queue support', () => {
+		let snsTopicArn, snsTopicName;
+		beforeAll(done => {
+			snsTopicName = `test-topic-${Date.now()}`;
+			sns.createTopic({
+				Name: snsTopicName
+			}).promise()
+			.then(result => snsTopicArn = result.TopicArn)
+			.then(done);
+		});
+		afterAll(done => {
+			destroyObjects({snsTopic: snsTopicArn})
+			.then(done, done.fail);
+		});
+		it('does not set up a DLQ configuration if not requested', done => {
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(configuration => {
+				expect(configuration.DeadLetterConfig).toBeFalsy();
+				return configuration.Role;
+			})
+			.then(roleArn => {
+				const roleName = roleArn.split(':')[5].split('/')[1];
+				return iam.listRolePolicies({ RoleName: roleName }).promise();
+			})
+			.then(result => {
+				expect(result.PolicyNames.find(t => t === 'dlq-publisher')).toBeFalsy();
+			})
+			.then(done, done.fail);
+		});
+		it('adds a SNS access policy and DLQ configuration by topic ARN if requested', done => {
+			config['dlq-sns'] = snsTopicArn;
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(configuration => {
+				expect(configuration.DeadLetterConfig).toEqual({TargetArn: snsTopicArn});
+				return configuration.Role;
+			})
+			.then(roleArn => {
+				const roleName = roleArn.split(':')[5].split('/')[1];
+				return iam.getRolePolicy({ PolicyName: 'dlq-publisher', RoleName: roleName }).promise();
+			})
+			.then(policy => {
+				expect(JSON.parse(decodeURIComponent(policy.PolicyDocument)).Statement).toEqual(
+					[{ Effect: 'Allow', Action: ['sns:Publish'], Resource: [snsTopicArn] }]
+				);
+			})
+			.then(done, done.fail);
+		});
+		it('adds a SNS access policy and DLQ configuration by topic name if requested', done => {
+			config['dlq-sns'] = snsTopicName;
+			createFromDir('hello-world')
+			.then(getLambdaConfiguration)
+			.then(configuration => {
+				expect(configuration.DeadLetterConfig).toEqual({TargetArn: snsTopicArn});
+				return configuration.Role;
+			})
+			.then(roleArn => {
+				const roleName = roleArn.split(':')[5].split('/')[1];
+				return iam.getRolePolicy({ PolicyName: 'dlq-publisher', RoleName: roleName }).promise();
+			})
+			.then(policy => {
+				expect(JSON.parse(decodeURIComponent(policy.PolicyDocument)).Statement).toEqual(
+					[{ Effect: 'Allow', Action: ['sns:Publish'], Resource: [snsTopicArn] }]
+				);
+			})
+			.then(done, done.fail);
+		});
+		describe('when a role is provided', () => {
+			let createdRoleArn, roleName;
+			beforeEach(done => {
+				roleName = `${testRunName}-manual`;
+				return iam.createRole({
+					RoleName: roleName,
+					AssumeRolePolicyDocument: executorPolicy()
+				}).promise()
+				.then(result => {
+					createdRoleArn = result.Role.Arn;
+				})
+				.then(() => iam.putRolePolicy({
+					RoleName: roleName,
+					PolicyName: 'manual-dlq-publisher',
+					PolicyDocument: snsPublishPolicy(snsTopicArn)
+				}).promise())
+				.then(done, done.fail);
+			});
+			afterEach(() => {
+				newObjects.lambdaRole = roleName;
+			});
+			it('does not patch the role', done => {
+				config['dlq-sns'] = snsTopicArn;
+				config.role = createdRoleArn;
+				createFromDir('hello-world')
+				.then(getLambdaConfiguration)
+				.then(configuration => {
+					expect(configuration.DeadLetterConfig).toEqual({TargetArn: snsTopicArn});
+					return configuration.Role;
+				})
+				.then(roleArn => {
+					const roleName = roleArn.split(':')[5].split('/')[1];
+					return iam.listRolePolicies({ RoleName: roleName }).promise();
+				})
+				.then(result => {
+					expect(result.PolicyNames.find(t => t === 'dlq-publisher')).toBeFalsy();
+				})
+				.then(done, done.fail);
+			});
 		});
 	});
 });

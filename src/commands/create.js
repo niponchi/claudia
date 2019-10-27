@@ -7,7 +7,6 @@ const path = require('path'),
 	cleanUpPackage = require('../tasks/clean-up-package'),
 	addPolicy = require('../tasks/add-policy'),
 	markAlias = require('../tasks/mark-alias'),
-	templateFile = require('../util/template-file'),
 	validatePackage = require('../tasks/validate-package'),
 	retriableWrap = require('../util/retriable-wrap'),
 	loggingWrap = require('../util/logging-wrap'),
@@ -23,6 +22,13 @@ const path = require('path'),
 	isRoleArn = require('../util/is-role-arn'),
 	lambdaCode = require('../tasks/lambda-code'),
 	initEnvVarsFromOptions = require('../util/init-env-vars-from-options'),
+	getOwnerInfo = require('../tasks/get-owner-info'),
+	executorPolicy = require('../policies/lambda-executor-policy'),
+	loggingPolicy = require('../policies/logging-policy'),
+	vpcPolicy = require('../policies/vpc-policy'),
+	snsPublishPolicy = require('../policies/sns-publish-policy'),
+	isSNSArn = require('../util/is-sns-arn'),
+	lambdaInvocationPolicy = require('../policies/lambda-invocation-policy'),
 	NullLogger = require('../util/null-logger');
 module.exports = function create(options, optionalLogger) {
 	'use strict';
@@ -33,14 +39,27 @@ module.exports = function create(options, optionalLogger) {
 		customEnvVars,
 		functionName,
 		workingDir,
+		ownerAccount,
+		awsPartition,
 		packageFileDir;
 	const logger = optionalLogger || new NullLogger(),
 		awsDelay = options && options['aws-delay'] && parseInt(options['aws-delay'], 10) || (process.env.AWS_DELAY && parseInt(process.env.AWS_DELAY, 10)) || 5000,
 		awsRetries = options && options['aws-retries'] && parseInt(options['aws-retries'], 10) || 15,
 		source = (options && options.source) || process.cwd(),
 		configFile = (options && options.config) || path.join(source, 'claudia.json'),
-		iam = loggingWrap(new aws.IAM(), {log: logger.logApiCall, logName: 'iam'}),
+		iam = loggingWrap(new aws.IAM({region: options.region}), {log: logger.logApiCall, logName: 'iam'}),
 		lambda = loggingWrap(new aws.Lambda({region: options.region}), {log: logger.logApiCall, logName: 'lambda'}),
+		s3 = loggingWrap(new aws.S3({region: options.region, signatureVersion: 'v4'}), {log: logger.logApiCall, logName: 's3'}),
+		getSnsDLQTopic = function () {
+			const topicNameOrArn = options['dlq-sns'];
+			if (!topicNameOrArn) {
+				return false;
+			}
+			if (isSNSArn(topicNameOrArn)) {
+				return topicNameOrArn;
+			}
+			return `arn:${awsPartition}:sns:${options.region}:${ownerAccount}:${topicNameOrArn}`;
+		},
 		apiGatewayPromise = retriableWrap(
 			loggingWrap(new aws.APIGateway({region: options.region}), {log: logger.logApiCall, logName: 'apigateway'}),
 			() => logger.logStage('rate-limited by AWS, waiting before retry')
@@ -70,6 +89,9 @@ module.exports = function create(options, optionalLogger) {
 			}
 			if (!options.handler && options['deploy-proxy-api']) {
 				return 'deploy-proxy-api requires a handler. please specify with --handler';
+			}
+			if (options['binary-media-types'] && !options['deploy-proxy-api']) {
+				return 'binary-media-types only works with --deploy-proxy-api';
 			}
 			if (!options['security-group-ids'] && options['subnet-ids']) {
 				return 'VPC access requires at least one security group id *and* one subnet id';
@@ -113,8 +135,8 @@ module.exports = function create(options, optionalLogger) {
 				if (options.timeout < 1) {
 					return 'the timeout value provided must be greater than or equal to 1';
 				}
-				if (options.timeout > 300) {
-					return 'the timeout value provided must be less than or equal to 300';
+				if (options.timeout > 900) {
+					return 'the timeout value provided must be less than or equal to 900';
 				}
 			}
 			if (options['allow-recursion'] && options.role && isRoleArn(options.role)) {
@@ -150,12 +172,16 @@ module.exports = function create(options, optionalLogger) {
 						KMSKeyArn: options['env-kms-key-arn'],
 						Handler: options.handler || (options['api-module'] + '.proxyRouter'),
 						Role: roleArn,
-						Runtime: options.runtime || 'nodejs8.10',
+						Runtime: options.runtime || 'nodejs10.x',
 						Publish: true,
+						Layers: options.layers && options.layers.split(','),
 						VpcConfig: options['security-group-ids'] && options['subnet-ids'] && {
 							SecurityGroupIds: (options['security-group-ids'] && options['security-group-ids'].split(',')),
 							SubnetIds: (options['subnet-ids'] && options['subnet-ids'].split(','))
-						}
+						},
+						DeadLetterConfig: getSnsDLQTopic() ? {
+							TargetArn: getSnsDLQTopic()
+						} : null
 					}).promise();
 				},
 				awsDelay, awsRetries,
@@ -163,7 +189,7 @@ module.exports = function create(options, optionalLogger) {
 					return error &&
 						error.code === 'InvalidParameterValueException' &&
 						(error.message === 'The role defined for the function cannot be assumed by Lambda.'
-						|| error.message === 'The provided execution role does not have permissions to call CreateNetworkInterface on EC2'
+						|| error.message.startsWith('The provided execution role does not have permissions')
 						|| error.message.startsWith('Lambda was unable to configure access to your environment variables because the KMS key is invalid for CreateGrant.')
 						);
 				},
@@ -206,7 +232,7 @@ module.exports = function create(options, optionalLogger) {
 					module: options['api-module'],
 					url: apiGWUrl(result.id, options.region, alias)
 				};
-				return rebuildWebApi(lambdaMetadata.FunctionName, alias, result.id, apiConfig, options.region, logger, options['cache-api-config']);
+				return rebuildWebApi(lambdaMetadata.FunctionName, alias, result.id, apiConfig, ownerAccount, awsPartition, options.region, logger, options['cache-api-config']);
 			})
 			.then(() => {
 				if (apiModule.postDeploy) {
@@ -287,33 +313,17 @@ module.exports = function create(options, optionalLogger) {
 				}
 				return iam.getRole({RoleName: options.role}).promise();
 			} else {
-				return fsPromise.readFileAsync(templateFile('lambda-exector-policy.json'), 'utf8')
-					.then(lambdaRolePolicy => {
-						return iam.createRole({
-							RoleName: functionName + '-executor',
-							AssumeRolePolicyDocument: lambdaRolePolicy
-						}).promise();
-					});
+				return iam.createRole({
+					RoleName: functionName + '-executor',
+					AssumeRolePolicyDocument: executorPolicy()
+				}).promise();
 			}
 		},
 		addExtraPolicies = function () {
 			return Promise.all(policyFiles().map(fileName => {
 				const policyName = path.basename(fileName).replace(/[^A-z0-9]/g, '-');
-				return addPolicy(policyName, roleMetadata.Role.RoleName, fileName);
+				return addPolicy(iam, policyName, roleMetadata.Role.RoleName, fileName);
 			}));
-		},
-		recursivePolicy = function (functionName) {
-			return JSON.stringify({
-				'Version': '2012-10-17',
-				'Statement': [{
-					'Sid': 'InvokePermission',
-					'Effect': 'Allow',
-					'Action': [
-						'lambda:InvokeFunction'
-					],
-					'Resource': 'arn:aws:lambda:' + options.region + ':*:function:' + functionName
-				}]
-			});
 		},
 		cleanup = function (result) {
 			if (!options.keep) {
@@ -333,6 +343,11 @@ module.exports = function create(options, optionalLogger) {
 	.then(packageInfo => {
 		functionName = packageInfo.name;
 		functionDesc = packageInfo.description;
+	})
+	.then(() => getOwnerInfo(options.region, logger))
+	.then(ownerInfo => {
+		ownerAccount = ownerInfo.account;
+		awsPartition = ownerInfo.partition;
 	})
 	.then(() => fsPromise.mkdtempAsync(os.tmpdir() + path.sep))
 	.then(dir => workingDir = dir)
@@ -358,7 +373,20 @@ module.exports = function create(options, optionalLogger) {
 	})
 	.then(() => {
 		if (!options.role) {
-			return addPolicy('log-writer', roleMetadata.Role.RoleName);
+			return iam.putRolePolicy({
+				RoleName: roleMetadata.Role.RoleName,
+				PolicyName: 'log-writer',
+				PolicyDocument: loggingPolicy(awsPartition)
+			}).promise()
+			.then(() => {
+				if (getSnsDLQTopic()) {
+					return iam.putRolePolicy({
+						RoleName: roleMetadata.Role.RoleName,
+						PolicyName: 'dlq-publisher',
+						PolicyDocument: snsPublishPolicy(getSnsDLQTopic())
+					}).promise();
+				}
+			});
 		}
 	})
 	.then(() => {
@@ -368,12 +396,11 @@ module.exports = function create(options, optionalLogger) {
 	})
 	.then(() => {
 		if (options['security-group-ids'] && !isRoleArn(options.role)) {
-			return fsPromise.readFileAsync(templateFile('vpc-policy.json'), 'utf8')
-			.then(vpcPolicy => iam.putRolePolicy({
+			return iam.putRolePolicy({
 				RoleName: roleMetadata.Role.RoleName,
 				PolicyName: 'vpc-access-execution',
-				PolicyDocument: vpcPolicy
-			}).promise());
+				PolicyDocument: vpcPolicy()
+			}).promise();
 		}
 	})
 	.then(() => {
@@ -381,11 +408,11 @@ module.exports = function create(options, optionalLogger) {
 			return iam.putRolePolicy({
 				RoleName: roleMetadata.Role.RoleName,
 				PolicyName: 'recursive-execution',
-				PolicyDocument: recursivePolicy(functionName)
+				PolicyDocument: lambdaInvocationPolicy(functionName, awsPartition, options.region)
 			}).promise();
 		}
 	})
-	.then(() => lambdaCode(packageArchive, options['use-s3-bucket'], options['s3-sse'], logger))
+	.then(() => lambdaCode(s3, packageArchive, options['use-s3-bucket'], options['s3-sse']))
 	.then(functionCode => {
 		s3Key = functionCode.S3Key;
 		return createLambda(functionName, functionDesc, functionCode, roleMetadata.Role.Arn);
@@ -395,7 +422,7 @@ module.exports = function create(options, optionalLogger) {
 		if (options['api-module']) {
 			return createWebApi(lambdaMetadata, packageFileDir);
 		} else if (options['deploy-proxy-api']) {
-			return deployProxyApi(lambdaMetadata, options, apiGatewayPromise, logger);
+			return deployProxyApi(lambdaMetadata, options, ownerAccount, awsPartition, apiGatewayPromise, logger);
 		} else {
 			return lambdaMetadata;
 		}
@@ -434,6 +461,15 @@ module.exports.doc = {
 			description: 'If specified, a proxy API will be created for the Lambda \n' +
 				' function on API Gateway, and forward all requests to function. \n' +
 				' This is an alternative way to create web APIs to --api-module.'
+		},
+		{
+			argument: 'binary-media-types',
+			optional: true,
+			description: 'A comma-delimited list of binary-media-types to \n' +
+				'set when using --deploy-proxy-api. Use an empty string in quotes \n' +
+				'to not set any binary media types.',
+			example: 'image/png,image/jpeg',
+			'default': '*/*'
 		},
 		{
 			argument: 'name',
@@ -483,7 +519,7 @@ module.exports.doc = {
 			argument: 'runtime',
 			optional: true,
 			description: 'Node.js runtime to use. For supported values, see\n http://docs.aws.amazon.com/lambda/latest/dg/API_CreateFunction.html',
-			default: 'nodejs8.10'
+			default: 'nodejs10.x'
 		},
 		{
 			argument: 'description',
@@ -600,6 +636,18 @@ module.exports.doc = {
 			argument: 'env-kms-key-arn',
 			optional: true,
 			description: 'KMS Key ARN to encrypt/decrypt environment variables'
+		},
+		{
+			argument: 'layers',
+			optional: true,
+			description: 'A comma-delimited list of Lambda layers to attach to this function',
+			example: 'arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4'
+		},
+		{
+			argument: 'dlq-sns',
+			optional: true,
+			description: 'Dead letter queue SNS topic name or ARN',
+			example: 'arn:aws:sns:us-east-1:123456789012:my_corporate_topic'
 		}
 	]
 };

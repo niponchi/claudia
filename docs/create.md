@@ -21,6 +21,11 @@ claudia create {OPTIONS}
 *  `--deploy-proxy-api`:  (_optional_) If specified, a proxy API will be created for the Lambda 
     function on API Gateway, and forward all requests to function.
     This is an alternative way to create web APIs to --api-module.
+*  `--binary-media-types`:  (_optional_) A comma-delimited list of binary-media-types to 
+    set when using --deploy-proxy-api. Use an empty string in quotes
+    to not set any binary media types.
+    * _For example_: image/png,image/jpeg
+    * _Defaults to_: */*
 *  `--name`:  (_optional_) lambda function name
     * _For example_: awesome-microservice
     * _Defaults to_: the project name from package.json
@@ -39,7 +44,7 @@ claudia create {OPTIONS}
     * _For example_: arn:aws:iam::123456789012:role/FileConverter
 *  `--runtime`:  (_optional_) Node.js runtime to use. For supported values, see
     http://docs.aws.amazon.com/lambda/latest/dg/API_CreateFunction.html
-    * _Defaults to_: nodejs8.10
+    * _Defaults to_: nodejs10.x
 *  `--description`:  (_optional_) Textual description of the lambda function
     * _Defaults to_: the project description from package.json
 *  `--memory`:  (_optional_) The amount of memory, in MB, your Lambda function is given.
@@ -85,3 +90,7 @@ claudia create {OPTIONS}
 *  `--set-env-from-json`:  (_optional_) file path to a JSON file containing environment variables to set
     * _For example_: production-env.json
 *  `--env-kms-key-arn`:  (_optional_) KMS Key ARN to encrypt/decrypt environment variables
+*  `--layers`:  (_optional_) A comma-delimited list of Lambda layers to attach to this function
+    * _For example_: arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4
+*  `--dlq-sns`:  (_optional_) Dead letter queue SNS topic name or ARN
+    * _For example_: arn:aws:sns:us-east-1:123456789012:my_corporate_topic

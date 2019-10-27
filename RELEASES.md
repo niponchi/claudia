@@ -1,5 +1,49 @@
 # Release history
 
+### 5.9.1 (21 October 2019)
+
+- fixing npm dependency vulnerabilities
+
+### 5.9.0 (17 October 2019)
+
+- support for tagging API Gateway resources (thanks to [Richard Jones](https://github.com/wigsaparelli).
+
+### 5.8.0 (29 August 2019)
+
+- support for adding SNS topic subscription filters
+- support for adding dead letter queues when creating functions
+- support for AWS partitions (making claudia work with aws-us-gov and aws-cn)
+
+### 5.7.0 (15 August 2019)
+
+- support for oauth2 authorization scopes, thanks to [Kevin Coleman](https://github.com/kevintechie).
+
+### 5.6.0 (12 July 2019)
+
+- add option to specify binary media types when deploying a proxy API, thanks to [Primož Verdnik](https://github.com/drye)
+
+### 5.5.0 (14 May 2019)
+
+- nodejs10.x used by default, removed support for node6.10
+- fix deployment to AWS China regions (https://github.com/claudiajs/claudia/issues/187)
+
+### 5.4.2 (22 March 2019)
+
+- support for command line prompts for MFA/STS authentication, thanks to [Grégory Horion](https://github.com/gregory).  
+- upgrade aws-sdk to avoid regression problems with 2.424.0 (https://github.com/aws/aws-sdk-js/issues/2588)
+
+### 5.4.0, 30 January 2019
+
+- support for MFA/STS authentication, thanks to [Grégory Horion](https://github.com/gregory).
+
+### 5.3.0, 27 December 2018
+
+- support for using Lambda Layers. Use `--layers` with `create`, or `--layers`, `--add-layers` and `--remove-layers` with `update`. 
+
+### 5.2.0, 15 November 2018
+
+- allow up to 900 second timeouts with Lambda, thanks to [Steven Chadwick](https://github.com/sschadwick)
+
 ### 5.1.2, 25 September 2018
 
 - using 0 as resultTtl for authorisers disables authoriser caching, thanks to [Savramis Sartios](https://github.com/sartios)

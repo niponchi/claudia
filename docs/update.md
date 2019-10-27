@@ -50,3 +50,19 @@ claudia update {OPTIONS}
 *  `--set-env-from-json`:  (_optional_) file path to a JSON file containing environment variables to set. replaces the whole set, removing old variables.
     * _For example_: production-env.json
 *  `--env-kms-key-arn`:  (_optional_) KMS Key ARN to encrypt/decrypt environment variables
+*  `--layers`:  (_optional_) A comma-delimited list of Lambda layers to attach to this function. Setting this during an update replaces all previous layers.
+    * _For example_: arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4
+*  `--add-layers`:  (_optional_) A comma-delimited list of additional Lambda layers to attach to this function. Setting this during an update leaves old layers in place, and just adds new layers.
+    * _For example_: arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4
+*  `--remove-layers`:  (_optional_) A comma-delimited list of Lambda layers to remove from this function. It will not remove any layers apart from the ones specified in the argument.
+    * _For example_: arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4
+*  `--dlq-sns`:  (_optional_) Dead letter queue SNS topic name or ARN
+    * _For example_: arn:aws:sns:us-east-1:123456789012:my_corporate_topic
+*  `--skip-iam`:  (_optional_) Do not try to modify the IAM role for Lambda
+    * _For example_: true
+*  `--aws-delay`:  (_optional_) number of milliseconds betweeen retrying AWS operations if they fail
+    * _For example_: 3000
+    * _Defaults to_: 5000
+*  `--aws-retries`:  (_optional_) number of times to retry AWS operations if they fail
+    * _For example_: 15
+    * _Defaults to_: 15
